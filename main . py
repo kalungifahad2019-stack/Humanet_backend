@@ -1,0 +1,297 @@
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from typing import Optional, List, Dict, Any
+import secrets
+import time
+
+app = FastAPI(title="Humanet API")
+
+# CORS (safe for now; tighten later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev: allow all
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------
+# In-memory “DB” (demo only)
+# --------------------------
+USERS: Dict[str, Dict[str, Any]] = {}            # email -> {password, role, name, age, location, goals}
+TOKENS: Dict[str, str] = {}                      # token -> email
+SURVEYS: List[Dict[str, Any]] = []               # {id,title,description,sdg,target_location,questions,author}
+SURVEY_RESPONSES: Dict[int, List[Dict[str, Any]]] = {}  # id -> list of {email,answers,ts}
+CIVIC_FEED: List[Dict[str, Any]] = []            # {id,category,title,content,location,verified,created_at}
+TUTORIALS: List[Dict[str, Any]] = []             # {id,title,content,sdg_tags,location,author,created_at}
+OPPS: List[Dict[str, Any]] = []                  # {id,title,details,location,sdg_tags,author,created_at}
+TOPICS: List[Dict[str, Any]] = []                # {id,title,content,author,created_at,comments:[{id,author,body,created_at}]}
+
+_id = {"survey": 1, "civic": 1, "tutorial": 1, "opp": 1, "topic": 1, "comment": 1}
+
+def now_iso():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+def require_token(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = authorization.split(" ", 1)[1].strip()
+    email = TOKENS.get(token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return email
+
+# --------------------------
+# Schemas
+# --------------------------
+class RegisterBody(BaseModel):
+    email: EmailStr
+    password: str
+    role: str  # "Individual" or "NGO"
+    name: str
+    age: Optional[int] = None
+    location: Optional[str] = None
+    goals: Optional[str] = None
+
+class LoginBody(BaseModel):
+    email: EmailStr
+    password: str
+
+class CreateSurveyBody(BaseModel):
+    title: str
+    description: str
+    sdg: int
+    target_location: str
+    questions: List[str]
+
+class RespondBody(BaseModel):
+    answers: Dict[int, str]
+
+class CivicReportBody(BaseModel):
+    category: str  # disaster, crime, achievement, sdg
+    title: str
+    content: str
+    location: str
+
+class TutorialBody(BaseModel):
+    title: str
+    content: str
+    sdg_tags: Optional[str] = None
+    location: Optional[str] = None
+
+class OpportunityBody(BaseModel):
+    title: str
+    details: str
+    location: str
+    sdg_tags: Optional[str] = None
+
+class NewTopicBody(BaseModel):
+    title: str
+    content: str
+
+class CommentBody(BaseModel):
+    topic_id: int
+    body: str
+
+class ReportSummaryBody(BaseModel):
+    survey_id: int
+    region: Optional[str] = None
+
+# --------------------------
+# Health
+# --------------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "humanet-api", "time": now_iso()}
+
+# --------------------------
+# Auth
+# --------------------------
+@app.post("/register")
+def register(body: RegisterBody):
+    if body.email in USERS:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    if body.role not in ("Individual", "NGO"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+    USERS[body.email] = {
+        "password": body.password,
+        "role": body.role,
+        "name": body.name,
+        "age": body.age,
+        "location": body.location,
+        "goals": body.goals,
+    }
+    token = secrets.token_urlsafe(24)
+    TOKENS[token] = body.email
+    return {"access_token": token, "role": body.role}
+
+@app.post("/login")
+def login(body: LoginBody):
+    user = USERS.get(body.email)
+    if not user or user["password"] != body.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = secrets.token_urlsafe(24)
+    TOKENS[token] = body.email
+    return {"access_token": token, "role": user["role"]}
+
+# --------------------------
+# Surveys
+# --------------------------
+@app.get("/surveys/list")
+def list_surveys(location: Optional[str] = None):
+    if not location:
+        return SURVEYS
+    return [s for s in SURVEYS if s["target_location"].lower() in location.lower()]
+
+@app.post("/surveys/create")
+def create_survey(body: CreateSurveyBody, email: str = Depends(require_token)):
+    role = USERS[email]["role"]
+    if role != "NGO":
+        raise HTTPException(status_code=403, detail="Only NGOs can create surveys")
+    s = {
+        "id": _id["survey"],
+        "title": body.title,
+        "description": body.description,
+        "sdg": body.sdg,
+        "target_location": body.target_location,
+        "questions": body.questions,
+        "author": email,
+        "created_at": now_iso(),
+    }
+    _id["survey"] += 1
+    SURVEYS.append(s)
+    SURVEY_RESPONSES[s["id"]] = []
+    return {"survey_id": s["id"]}
+
+@app.post("/surveys/{survey_id}/respond")
+def respond_survey(survey_id: int, body: RespondBody, email: str = Depends(require_token)):
+    found = next((s for s in SURVEYS if s["id"] == survey_id), None)
+    if not found:
+        raise HTTPException(status_code=404, detail="Survey not found")
+    SURVEY_RESPONSES[survey_id].append({"email": email, "answers": body.answers, "ts": now_iso()})
+    return {"ok": True}
+
+# --------------------------
+# Civic Reports
+# --------------------------
+@app.post("/civic/report")
+def civic_report(body: CivicReportBody, email: str = Depends(require_token)):
+    if body.category not in ("disaster", "crime", "achievement", "sdg"):
+        raise HTTPException(status_code=400, detail="Invalid category")
+    r = {
+        "id": _id["civic"],
+        "category": body.category,
+        "title": body.title,
+        "content": body.content,
+        "location": body.location,
+        "verified": True,  # demo “human check”
+        "created_at": now_iso(),
+        "author": email,
+    }
+    _id["civic"] += 1
+    CIVIC_FEED.append(r)
+    return r
+
+@app.get("/civic/feed")
+def civic_feed(location: Optional[str] = None, category: Optional[str] = None):
+    items = CIVIC_FEED
+    if location:
+        items = [x for x in items if location.lower() in x["location"].lower()]
+    if category:
+        items = [x for x in items if x["category"] == category]
+    return items
+
+# --------------------------
+# SkillUp
+# --------------------------
+@app.post("/skillup/tutorials/create")
+def create_tutorial(body: TutorialBody, email: str = Depends(require_token)):
+    t = {
+        "id": _id["tutorial"],
+        "title": body.title,
+        "content": body.content,
+        "sdg_tags": body.sdg_tags,
+        "location": body.location,
+        "author": email,
+        "created_at": now_iso(),
+    }
+    _id["tutorial"] += 1
+    TUTORIALS.append(t)
+    return {"tutorial_id": t["id"]}
+
+@app.get("/skillup/tutorials")
+def list_tutorials(tag: Optional[str] = None, location: Optional[str] = None):
+    items = TUTORIALS
+    if tag:
+        items = [x for x in items if (x.get("sdg_tags") or "").lower().find(tag.lower()) >= 0]
+    if location:
+        items = [x for x in items if (x.get("location") or "").lower().find(location.lower()) >= 0]
+    return items
+
+@app.post("/skillup/opportunities/create")
+def create_opportunity(body: OpportunityBody, email: str = Depends(require_token)):
+    o = {
+        "id": _id["opp"],
+        "title": body.title,
+        "details": body.details,
+        "location": body.location,
+        "sdg_tags": body.sdg_tags,
+        "author": email,
+        "created_at": now_iso(),
+    }
+    _id["opp"] += 1
+    OPPS.append(o)
+    return {"opportunity_id": o["id"]}
+
+@app.get("/skillup/opportunities")
+def list_opportunities(location: Optional[str] = None):
+    items = OPPS
+    if location:
+        items = [x for x in items if location.lower() in x["location"].lower()]
+    return items
+
+# --------------------------
+# Discussions
+# --------------------------
+@app.post("/discussions/new")
+def new_topic(body: NewTopicBody, email: str = Depends(require_token)):
+    t = {
+        "id": _id["topic"],
+        "title": body.title,
+        "content": body.content,
+        "author": email,
+        "created_at": now_iso(),
+        "comments": [],
+    }
+    _id["topic"] += 1
+    TOPICS.append(t)
+    return {"topic_id": t["id"]}
+
+@app.post("/discussions/list")
+def list_topics():
+    return {"topics": TOPICS}
+
+@app.post("/discussions/comment")
+def add_comment(body: CommentBody, email: str = Depends(require_token)):
+    topic = next((x for x in TOPICS if x["id"] == body.topic_id), None)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    c = {"id": _id["comment"], "author": email, "body": body.body, "created_at": now_iso()}
+    _id["comment"] += 1
+    topic["comments"].append(c)
+    return {"comment_id": c["id"]}
+
+# --------------------------
+# NGO AI-like Summary (mock)
+# --------------------------
+@app.post("/reports/ai-summary")
+def ai_summary(body: ReportSummaryBody):
+    responses = SURVEY_RESPONSES.get(body.survey_id, [])
+    count = len(responses)
+    summary = (
+        f"Survey {body.survey_id} has {count} responses. "
+        f"{'Region filter: ' + body.region if body.region else 'No region filter.'} "
+        f"Common themes: access to water, education, local safety. (Demo summary)"
+    )
+    return {"count": count, "summary": summary}
